@@ -1,0 +1,36 @@
+services:
+
+  rtsp_server:
+    image: rtspserver
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: file_boardcaster
+    networks:
+      - shared_network
+    ports:
+      - "8553:8553"
+      - "8552:8552"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      #- DISPLAY=:1
+      - PYTHONPATH=/server
+      - GST_DEBUG=3
+    volumes:
+      - ./server/:/server/
+    privileged: true
+    working_dir: /server
+    entrypoint: ["python3", "main.py"]
+
+    restart: "no"
+
+
+volumes:
+  minio_shared_data:
+
+networks:
+  shared_network:
+    external: true
