@@ -5,12 +5,14 @@ gi.require_version('GstRtspServer', '1.0')
 gi.require_version('GstApp', '1.0')
 from gi.repository import Gst, GstRtspServer, GstApp, GLib
 import os, glob
+import json
 import shlex
 import signal
 import subprocess
 import logging
 import threading
 import time
+from urllib.parse import quote
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 LOW_LATENCY_QUEUE = "queue max-size-buffers=120 max-size-time=1000000000 max-size-bytes=0 leaky=downstream"
@@ -273,6 +275,37 @@ class SimpleLoopRtspMediaFactory(GstRtspServer.RTSPMediaFactory):
     def on_media_configure(self, _factory, media):
         """Đảm bảo media không bị suspend khi không có client."""
         media.set_automatic_direction(False)
+
+
+class NativeLoopRtspMediaFactory(SimpleLoopRtspMediaFactory):
+    """Pass through an H.264 or H.265 file and loop it at EOS."""
+    def __init__(self, filepath: str, codec: str):
+        self.codec = codec
+        super().__init__(filepath, with_audio=False)
+
+    def do_create_element(self, _url):
+        filepath = GLib.filename_to_uri(os.path.abspath(self.filepath))
+        if self.codec == "h264":
+            caps = "video/x-h264"
+            parser = "h264parse config-interval=-1"
+            payloader = "rtph264pay"
+            config_interval = "1"
+        else:
+            caps = "video/x-h265"
+            parser = "h265parse config-interval=-1"
+            payloader = "rtph265pay"
+            config_interval = "-1"
+
+        pipeline = (
+            f'( uridecodebin uri="{filepath}" caps="{caps}" '
+            f'! queue max-size-buffers=120 max-size-time=2000000000 max-size-bytes=0 '
+            f'! {parser} '
+            f'! {caps},stream-format=byte-stream,alignment=au '
+            '! identity sync=true single-segment=true '
+            f'! {payloader} name=pay0 pt=96 config-interval={config_interval} mtu=1400 )'
+        )
+        logging.info(f"{self.codec.upper()} passthrough loop pipeline: {pipeline}")
+        return Gst.parse_launch(pipeline)
 
 
 class UdpRelayRtspMediaFactory(GstRtspServer.RTSPMediaFactory):
@@ -635,6 +668,7 @@ class FileBoardcaster:
         self.rtspServer = rtspServer
         self.rtspServer.set_service("8553")
         self._factories = []  # keep refs so factories aren't GC'ed
+        self._dynamic_factories = {}
         self._processes: list[subprocess.Popen] = []
 
         self.rtspServer.attach(None)
@@ -783,6 +817,39 @@ class FileBoardcaster:
                      f"rtsp://127.0.0.1:8553{mount_path}")
         return [(mount_path, filepath)]
 
+    def broadcast_native_loop_file(self, filepath: str, mount_path: str,
+                                   codec: str) -> list[tuple[str, str]]:
+        """Publish a native H.264/H.265 file as a looping RTSP stream."""
+        filepath = os.path.abspath(filepath)
+        if not os.path.isfile(filepath):
+            logging.error(f"Video file not found: {filepath}")
+            return []
+
+        if not mount_path.startswith("/"):
+            mount_path = f"/{mount_path}"
+
+        self.remove_dynamic_stream(mount_path)
+        factory = NativeLoopRtspMediaFactory(filepath, codec)
+        factory.set_shared(True)
+        factory.set_eos_shutdown(False)
+        factory.set_suspend_mode(GstRtspServer.RTSPSuspendMode.NONE)
+        factory.set_stop_on_disconnect(False)
+        self.rtspServer.get_mount_points().add_factory(mount_path, factory)
+        self._factories.append(factory)
+        self._dynamic_factories[mount_path] = factory
+
+        logging.info(f"Mounted {codec.upper()} loop {filepath} at "
+                     f"rtsp://127.0.0.1:8553{mount_path}")
+        return [(mount_path, filepath)]
+
+    def remove_dynamic_stream(self, mount_path: str) -> None:
+        factory = self._dynamic_factories.pop(mount_path, None)
+        if factory is not None:
+            self.rtspServer.get_mount_points().remove_factory(mount_path)
+            if factory in self._factories:
+                self._factories.remove(factory)
+            logging.info(f"Removed RTSP stream {mount_path}")
+
     def broadcast_loop_folder(self, folder: str, with_audio: bool = True,
                               patterns: tuple[str, ...] = ("*.mp4", "*.mov", "*.m4v")) -> list[tuple[str, str]]:
         """
@@ -900,35 +967,187 @@ class FileBoardcaster:
         logging.info(f"Mounted sequence at rtsp://127.0.0.1:8553{mount_path}")
 
 
+def probe_video_codec(filepath: str) -> str:
+    """Return the first video stream's codec name using ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name", "-of", "json", filepath,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams or not streams[0].get("codec_name"):
+        raise ValueError("No video stream found")
+    return streams[0]["codec_name"].lower()
+
+
+class RecursiveVideoWatcher:
+    def __init__(self, broadcaster: FileBoardcaster, watch_dirs: list[str],
+                 scan_interval: float = 3.0):
+        self.broadcaster = broadcaster
+        self.watch_dirs = [os.path.abspath(path) for path in watch_dirs]
+        self.scan_interval = max(1.0, scan_interval)
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._observed: dict[str, tuple[tuple[int, int], int]] = {}
+        self._processed: dict[str, tuple[int, int]] = {}
+        self._registered: dict[str, tuple[list[str], tuple[int, int]]] = {}
+        self._route_owners: dict[str, str] = {}
+        self._route_conflicts: dict[str, set[str]] = {}
+
+    def start(self) -> None:
+        logging.info(f"Watching video folders recursively: {', '.join(self.watch_dirs)}")
+        self._thread = threading.Thread(target=self._scan_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _iter_files(self):
+        for root in self.watch_dirs:
+            if os.path.isfile(root):
+                yield root
+                continue
+            if not os.path.isdir(root):
+                logging.warning(f"Video watch folder does not exist: {root}")
+                continue
+            for directory, subdirs, filenames in os.walk(root):
+                subdirs[:] = [name for name in subdirs if name not in (".git", "__pycache__")]
+                for filename in filenames:
+                    if not filename.startswith("."):
+                        yield os.path.join(directory, filename)
+
+    def _scan_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._scan_once()
+            except Exception:
+                logging.exception("Video folder scan failed")
+            self._stop_event.wait(self.scan_interval)
+
+    def _scan_once(self) -> None:
+        candidates = set(self._iter_files())
+        for filepath in sorted(candidates):
+            try:
+                stat = os.stat(filepath)
+            except OSError:
+                continue
+            signature = (stat.st_size, stat.st_mtime_ns)
+            previous = self._observed.get(filepath)
+            if previous is None or previous[0] != signature:
+                self._observed[filepath] = (signature, 1)
+                continue
+
+            stable_scans = previous[1] + 1
+            self._observed[filepath] = (signature, stable_scans)
+            if stable_scans < 2 or self._processed.get(filepath) == signature:
+                continue
+
+            if self._process_file(filepath, signature):
+                self._processed[filepath] = signature
+
+        for filepath in list(self._observed):
+            if filepath in candidates:
+                continue
+            self._observed.pop(filepath, None)
+            self._processed.pop(filepath, None)
+            self._remove_registration(filepath)
+            for conflicts in self._route_conflicts.values():
+                conflicts.discard(filepath)
+
+    def _remove_registration(self, filepath: str) -> None:
+        registration = self._registered.pop(filepath, None)
+        if registration is None:
+            return
+
+        mount_paths, _ = registration
+        for mount_path in mount_paths:
+            if self._route_owners.get(mount_path) != filepath:
+                continue
+            self._route_owners.pop(mount_path, None)
+            GLib.idle_add(self.broadcaster.remove_dynamic_stream, mount_path)
+            for waiting_path in self._route_conflicts.pop(mount_path, set()):
+                self._processed.pop(waiting_path, None)
+
+    def _process_file(self, filepath: str, signature: tuple[int, int]) -> bool:
+        try:
+            source_codec = probe_video_codec(filepath)
+        except Exception as error:
+            logging.info(f"Skipping non-video or unsupported file {filepath}: {error}")
+            self._remove_registration(filepath)
+            return True
+
+        if source_codec == "h264":
+            output_codec = "h264"
+        elif source_codec in ("hevc", "h265"):
+            output_codec = "h265"
+        else:
+            logging.info(
+                f"Skipping {filepath}: RTSP accepts H.264/H.265 files; "
+                "run transcode.py to create a compatible file in media/"
+            )
+            self._remove_registration(filepath)
+            return True
+
+        filename = os.path.splitext(os.path.basename(filepath))[0]
+        mount_path = "/" + quote(filename, safe="-_.~")
+
+        registration = self._registered.get(filepath)
+        if registration is not None and registration[1] != signature:
+            self._remove_registration(filepath)
+            registration = None
+
+        registered_paths = registration[0] if registration is not None else []
+        self._registered[filepath] = (registered_paths, signature)
+
+        current_owner = self._route_owners.get(mount_path)
+        if current_owner is not None and current_owner != filepath:
+            logging.warning(
+                f"Skipping duplicate stream path '{mount_path}': {filepath} "
+                f"conflicts with {current_owner}"
+            )
+            self._route_conflicts.setdefault(mount_path, set()).add(filepath)
+            return True
+        if current_owner == filepath and mount_path in registered_paths:
+            return True
+
+        self._route_owners[mount_path] = filepath
+        registered_paths.append(mount_path)
+        GLib.idle_add(self._mount_file, filepath, filepath, output_codec, mount_path)
+        logging.info(
+            f"Detected {source_codec} video {filepath}; RTSP path={mount_path}"
+        )
+        return True
+
+    def _mount_file(self, source_path: str, playback_path: str,
+                    codec: str, mount_path: str) -> bool:
+        if os.path.isfile(source_path):
+            self.broadcaster.broadcast_native_loop_file(playback_path, mount_path, codec)
+        return False
+
+
 if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    watch_dirs = [
+        path.strip()
+        for path in os.environ.get(
+            "VIDEO_WATCH_DIRS", os.path.join(script_dir, "media")
+        ).split(",")
+        if path.strip()
+    ]
     Gst.init(None)
     loop = GLib.MainLoop()
     s = FileBoardcaster(GstRtspServer.RTSPServer())
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    video_file = os.path.join(script_dir, "server_assets", "0719_with_black.mp4")
-
-    # Cách sử dụng mới - AUTO-LOOP (đáng tin cậy nhất):
-    # Khi video kết thúc hoặc có lỗi, pipeline tự động restart lại từ đầu
-    # Link RTSP không bao giờ bị chết
-
-    # Chỉ publish duy nhất video được chọn qua một URL cố định.
-    mounted_streams = s.broadcast_auto_loop_file(video_file, "/stream")
-
-    # 2. Chuỗi video lặp lại bằng một URL chung đang tắt để tránh EOS từ concat.
-    # s.broadcast_sequence_loop("/loop_combined", assets_dir)
-
-    # Cách sử dụng cũ - KHÔNG loop:
-    # s.broadcast_folder(assets_dir, with_audio=True)
-    # s.broadcast_sequence("/combined", assets_dir)
-
-    logging.info("=" * 60)
-    logging.info("RTSP URLs available:")
-    for mount_path, _file_path in mounted_streams:
-        logging.info(f"  - {mount_path}")
-    logging.info("=" * 60)
+    watcher = RecursiveVideoWatcher(s, watch_dirs)
+    watcher.start()
 
     try:
         loop.run()
     finally:
+        watcher.stop()
         s.stop()
